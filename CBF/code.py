@@ -1,210 +1,230 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
+from sentence_transformers import SentenceTransformer, util
+import random
 import os
-
-from gensim.models import Word2Vec
-from sklearn.metrics.pairwise import cosine_similarity
-
 
 DATA_DIR = "./data"
 
 
-# =============================================
-#                  전처리
-# =============================================
-def preprocess_raw_data():
-    print("\n=== 1. 전처리 시작 ===")
-
+# ===============================================
+# 1. 데이터 전처리 + BERT 임베딩 준비
+# ===============================================
+def load_and_preprocess():
     books = pd.read_csv(os.path.join(DATA_DIR, "Books.csv"), low_memory=False)
-    users = pd.read_csv(os.path.join(DATA_DIR, "Users.csv"), low_memory=False)
-    ratings = pd.read_csv(os.path.join(DATA_DIR, "Ratings.csv"), low_memory=False)
 
-    books["Book-Title"] = books["Book-Title"].fillna("Unknown Title")
-    books["Book-Author"] = books["Book-Author"].fillna("Unknown Author")
-    books["Publisher"] = books["Publisher"].fillna("Unknown Publisher")
-
-    ratings = ratings[
-        (ratings["Book-Rating"] >= 0) &
-        (ratings["Book-Rating"] <= 10)
-    ]
-
-    books = books[["ISBN", "Book-Title", "Book-Author"]].set_index("ISBN")
-
-    print("=== 1. 전처리 완료 ===")
-    return books, users, ratings
-
-
-# =============================================
-#           ISBN 중복 제거
-# =============================================
-def deduplicate_books(books):
-    print("\n=== ISBN 중복 제거 ===")
-
-    before = len(books)
-    df = books.reset_index()
-    df = df.drop_duplicates(subset=["Book-Title", "Book-Author"])
-    df = df.set_index("ISBN")
-    after = len(df)
-
-    print(f"중복 제거: {before} → {after}")
-    return df
-
-
-# =============================================
-#              Word2Vec 학습용 토큰화
-# =============================================
-def tokenize_books(books):
-    print("\n=== 2. 책 텍스트 토큰화 ===")
-
-    sentences = []
-    for _, row in books.iterrows():
-        title = str(row["Book-Title"]).lower().split()
-        author = str(row["Book-Author"]).lower().split()
-        sentences.append(title + author)
-    return sentences
-
-
-# =============================================
-#             Word2Vec 학습
-# =============================================
-def train_w2v(sentences):
-    print("\n=== 3. Word2Vec 학습 시작 ===")
-    model = Word2Vec(
-        sentences,
-        vector_size=100,
-        window=5,
-        min_count=2,
-        workers=4,
-        sg=1  
+    # 텍스트 생성 (제목 + 저자)
+    books["text"] = (
+        books["Book-Title"].fillna("") + " [SEP] " +
+        books["Book-Author"].fillna("")
     )
-    print("=== Word2Vec 학습 완료 ===")
-    return model
+
+    # ISBN 중복 제거
+    before = len(books)
+    books = books.drop_duplicates(subset=["ISBN"])
+    after = len(books)
+    print(f"ISBN 중복 제거: {before} → {after}")
+
+    books = books.reset_index(drop=True)
+    return books
 
 
-# =============================================
-#        책 임베딩 생성 (단어 임베딩 평균)
-# =============================================
-def build_book_vectors(books, model):
-    print("\n=== 4. 책 임베딩 생성 ===")
+# ===============================================
+# 2. BERT Sentence Embedding 생성
+# ===============================================
+def build_bert_embeddings(texts):
+    print("\n=== BERT Sentence Embedding 생성 시작 ===")
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = model.encode(texts, convert_to_tensor=True, show_progress_bar=True)
+    print("=== BERT Sentence Embedding 생성 완료 ===")
+    return model, embeddings
 
+
+# ===============================================
+# 3. 사용자 취향 벡터 생성
+# ===============================================
+def build_user_vector(user_id, ratings, books, book_emb):
+    user_ratings = ratings[ratings["User-ID"] == user_id]
+
+    if len(user_ratings) < 2:
+        return None, None
+
+    # 평점 기준으로 가중 평균
     vectors = []
-    for _, row in books.iterrows():
-        words = str(row["Book-Title"]).lower().split() + \
-                str(row["Book-Author"]).lower().split()
+    weights = []
 
-        valid = [model.wv[w] for w in words if w in model.wv]
-
-        if len(valid) == 0:
-            vec = np.zeros(model.vector_size)
-        else:
-            vec = np.mean(valid, axis=0)
-
-        vectors.append(vec)
-
-    return np.array(vectors)
-
-
-# =============================================
-#            책 벡터 개별 리턴
-# =============================================
-def get_book_vector(isbn, books, book_vectors):
-    isbn_to_idx = {isbn: i for i, isbn in enumerate(books.index)}
-    if isbn not in isbn_to_idx:
-        return None
-    return book_vectors[isbn_to_idx[isbn]]
-
-
-# =============================================
-#              사용자 벡터 생성 (평점 가중치)
-# =============================================
-def get_user_vector(user_id, ratings, books, book_vectors):
-    history = ratings[ratings["User-ID"] == user_id]
-
-    if len(history) == 0:
-        return None
-
-    isbn_to_idx = {isbn: i for i, isbn in enumerate(books.index)}
-
-    weighted_sum = np.zeros(book_vectors.shape[1])
-    total_weight = 0
-
-    for _, row in history.iterrows():
+    for _, row in user_ratings.iterrows():
         isbn = row["ISBN"]
         rating = row["Book-Rating"]
 
-        if isbn not in isbn_to_idx:
+        idx = books.index[books["ISBN"] == isbn]
+        if len(idx) == 0:
             continue
+        idx = idx[0]
 
-        idx = isbn_to_idx[isbn]
-        weighted_sum += book_vectors[idx] * rating
-        total_weight += rating
+        vectors.append(book_emb[idx])
+        weights.append(rating)
 
-    if total_weight == 0:
+    if len(vectors) == 0:
+        return None, None
+
+    weights = np.array(weights)
+    weights = weights / (weights.sum() + 1e-9)
+
+    user_vec = sum(v * w for v, w in zip(vectors, weights))
+    return user_vec, user_ratings
+
+
+# ===============================================
+# 4. 책 추천
+# ===============================================
+def recommend_books(user_vec, book_emb, books, top_k=10):
+    scores = util.cos_sim(user_vec, book_emb)[0]
+    top_idx = scores.topk(top_k).indices.tolist()
+    top_scores = scores[top_idx].tolist()
+
+    return top_idx, top_scores
+
+
+# ===============================================
+# 5. 추천 이유 생성 (BERT 기반)
+# ===============================================
+def explain_recommendation(user_vec, book_vec, model):
+    # 가장 유사한 단어/토큰을 뽑아 설명 흉내
+    sim = util.cos_sim(user_vec, book_vec).item()
+    return f"cosine={sim:.4f}"
+
+
+# ===============================================
+# 6. LOO 평가 한 명 (상세)
+# ===============================================
+def evaluate_one_user(user_id, books, ratings, book_emb, model):
+    user_ratings = ratings[ratings["User-ID"] == user_id]
+
+    if len(user_ratings) < 2:
         return None
 
-    return weighted_sum / total_weight
+    # 숨길 책 선택
+    hidden = user_ratings.sample(1).iloc[0]
+    hidden_isbn = hidden["ISBN"]
+    hidden_title = books.loc[books["ISBN"] == hidden_isbn, "Book-Title"].values[0]
 
+    # 남은 책으로 학습
+    remain = user_ratings[user_ratings["ISBN"] != hidden_isbn].copy()
 
-# =============================================
-#          추천 이유(Explanation) 생성
-# =============================================
-def explain_recommendation(model, user_vec, book_vec, topn=5):
-    user_sim = model.wv.similar_by_vector(user_vec, topn=20)
-    book_sim = model.wv.similar_by_vector(book_vec, topn=20)
+    ratings_copy = ratings.copy()
+    ratings_copy = ratings_copy[
+        ~((ratings_copy["User-ID"] == user_id) &
+          (ratings_copy["ISBN"] == hidden_isbn))
+    ]
 
-    user_words = [w for w, _ in user_sim]
-    book_words = [w for w, _ in book_sim]
-
-    common = [w for w in user_words if w in book_words]
-
-    if len(common) == 0:
-        common = user_words[:3] + book_words[:3]
-
-    return common[:topn]
-
-
-# =============================================
-#                 추천 생성
-# =============================================
-def recommend_books(user_id, ratings, books, book_vectors, model, top_k=5):
-    user_vec = get_user_vector(user_id, ratings, books, book_vectors)
+    user_vec, _ = build_user_vector(user_id, ratings_copy, books, book_emb)
     if user_vec is None:
-        return [], None, None
+        return None
 
-    sim_scores = cosine_similarity([user_vec], book_vectors).flatten()
-    top_idx = sim_scores.argsort()[::-1][:top_k]
+    top_idx, top_scores = recommend_books(user_vec, book_emb, books, top_k=10)
 
-    rec_isbns = books.iloc[top_idx].index.tolist()
-    return rec_isbns, sim_scores[top_idx], user_vec
+    print(f"\n========= 상세 평가 시작: User {user_id} =========\n")
+    print(f"[숨긴 책] {hidden_title} | ISBN={hidden_isbn}\n")
 
+    print("[추천 TOP 10 목록]")
+    found_rank = None
+    hidden_vec = None
+    try:
+        hidden_vec = book_emb[books.index[books["ISBN"] == hidden_isbn][0]]
+    except:
+        pass
 
-# =============================================
-#                    MAIN
-# =============================================
-if __name__ == "__main__":
-    books, users, ratings = preprocess_raw_data()
-    books = deduplicate_books(books)
+    for rank, (idx, score) in enumerate(zip(top_idx, top_scores), start=1):
+        rec_title = books.iloc[idx]["Book-Title"]
+        rec_isbn = books.iloc[idx]["ISBN"]
 
-    sentences = tokenize_books(books)
-    w2v = train_w2v(sentences)
+        explanation = ""
+        if hidden_vec is not None:
+            explanation = explain_recommendation(user_vec, book_emb[idx], model)
 
-    book_vectors = build_book_vectors(books, w2v)
+        print(f" {rank:2d}. {rec_title} | score={score:.4f}")
+        print(f"    추천 이유: {explanation}")
 
-    test_user = ratings["User-ID"].sample(1).iloc[0]
+        if rec_isbn == hidden_isbn:
+            found_rank = rank
 
-    recs, scores, user_vec = recommend_books(test_user, ratings, books, book_vectors, w2v, top_k=5)
-
-    if recs:
-        print(f"\n=== 사용자 {test_user} 추천 ===")
-
-        for isbn, score in zip(recs, scores):
-            title = books.loc[isbn]["Book-Title"]
-            book_vec = get_book_vector(isbn, books, book_vectors)
-
-            reasons = explain_recommendation(w2v, user_vec, book_vec)
-
-            print(f"- {title} | {score:.4f}")
-            print(f"  추천 이유: {', '.join(reasons)}")
-
+    if found_rank is None:
+        print("\n✘ 숨긴 책이 TOP 10에 없음 → MISS")
     else:
-        print(f"\n사용자 {test_user}는 추천 불가 (평점 데이터 부족)")
+        print(f"\n✔ 숨긴 책이 {found_rank}위에 존재 → HIT")
+
+    print("\n=====================================================\n")
+
+    return found_rank is not None, found_rank
+
+
+# ===============================================
+# 7. 100명 HR@5 평가
+# ===============================================
+def evaluate_many_users(books, ratings, book_emb, model, sample_size=100):
+    users = ratings["User-ID"].unique()
+    sampled = np.random.choice(users, size=sample_size, replace=False)
+
+    hit = 0
+    valid = 0
+
+    for user_id in sampled:
+        result = evaluate_one_user_simple(user_id, books, ratings, book_emb)
+        if result is None:
+            continue
+        valid += 1
+        hit += int(result)
+
+    hr5 = hit / (valid + 1e-9)
+
+    print("\n===== 100명 HR@5 평가 결과 =====")
+    print(f"총 평가 가능 사용자 수: {valid}")
+    print(f"HIT 수: {hit}")
+    print(f"HR@5: {hr5:.4f}")
+    print("=================================\n")
+
+
+def evaluate_one_user_simple(user_id, books, ratings, book_emb):
+    user_ratings = ratings[ratings["User-ID"] == user_id]
+    if len(user_ratings) < 2:
+        return None
+
+    hidden = user_ratings.sample(1).iloc[0]
+    hidden_isbn = hidden["ISBN"]
+
+    ratings_copy = ratings[
+        ~((ratings["User-ID"] == user_id) &
+          (ratings["ISBN"] == hidden_isbn))
+    ]
+
+    user_vec, _ = build_user_vector(user_id, ratings_copy, books, book_emb)
+    if user_vec is None:
+        return None
+
+    top_idx, _ = recommend_books(user_vec, book_emb, books, top_k=5)
+
+    top_isbns = [books.iloc[i]["ISBN"] for i in top_idx]
+
+    return hidden_isbn in top_isbns
+
+
+# ===============================================
+# MAIN
+# ===============================================
+if __name__ == "__main__":
+
+    print("=== 1. 전처리 시작 ===")
+    books = load_and_preprocess()
+    ratings = pd.read_csv(os.path.join(DATA_DIR, "Ratings.csv"), low_memory=False)
+    print("=== 1. 전처리 완료 ===\n")
+
+    print("=== 2. BERT 임베딩 생성 ===")
+    model, book_emb = build_bert_embeddings(books["text"].tolist())
+
+    # 상세 평가 1명
+    random_user = ratings["User-ID"].sample(1).iloc[0]
+    evaluate_one_user(random_user, books, ratings, book_emb, model)
+
+    # 100명 HR@5 평가
+    evaluate_many_users(books, ratings, book_emb, model)
