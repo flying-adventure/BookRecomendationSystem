@@ -1,0 +1,20 @@
+# 가상 환경 폴더 제외
+.venv*
+*.venv
+*.venv310
+*.venv-linux
+
+# 파이썬 캐시 파일 제외
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter 노트북 캐시 제외
+.ipynb_checkpoints/
+
+# PDF 파일 제외
+*.pdf
+
+# Git/System files
+.git
+.gitignore

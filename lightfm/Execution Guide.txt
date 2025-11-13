@@ -1,0 +1,13 @@
+1. Dataset 준비
+https://www.kaggle.com/datasets/arashnic/book-recommendation-dataset
+dataset 다운 후 data 파일 안으로 경로 변경
+
+2. 전처리 및 특징 파일 생성
+notebook/data_preprocessing.ipynb을 통해 모델 학습에 필요한 특징 파일 (user_features.npz, item_features.npz, encoders.pkl 등)을 생성
+
+3. Docker 이미지 빌드 및 실행
+a. docker build -t bookrec-image . - 현재 디렉토리의 Dockerfile을 사용하여 실행 가능한 이미지 생성
+b. docker run -it --rm bookrec-image /bin/bash - 빌드된 이미지로 컨테이너 접속하여 내부 터미널 접속
+
+4. 스크립트 실행
+python3 src/recommender_system.py
